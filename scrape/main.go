@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/hashicorp/go-retryablehttp"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/urfave/cli.v2"
@@ -34,17 +35,34 @@ func main() {
 					return WriteAllCardURLs(c.String("path"))
 				},
 				Flags: []cli.Flag{
-					&cli.StringFlag{Name: "path", Value: "card-urls.txt"},
+					&cli.StringFlag{
+						Name:  "path",
+						Value: "card-urls.txt",
+						Usage: "Path to write card URLs to, on each line.",
+					},
 				},
 			},
 			{
 				Name:   "parse",
 				Action: doParse,
 				Flags: []cli.Flag{
-					&cli.StringFlag{Name: "from-html"},
-					&cli.StringFlag{Name: "from-urls"},
-					&cli.StringFlag{Name: "out", Value: "cards.json"},
-					&cli.StringFlag{Name: "images", Value: "images.json"},
+					&cli.StringFlag{
+						Name:  "from-html",
+						Usage: "Path to HTML pre-fetched card or directory of.",
+					},
+					&cli.StringFlag{
+						Name:  "from-urls",
+						Usage: "Path to text file of card URLs, one on each line.",
+					},
+					&cli.StringFlag{
+						Name:  "cards",
+						Value: "cards.json",
+						Usage: "Where to write JSON cards to.",
+					},
+					&cli.StringFlag{
+						Name:  "images",
+						Usage: "If set, path to JSON with fetched image bytes.",
+					},
 				},
 			},
 		},
@@ -59,14 +77,14 @@ func doParse(c *cli.Context) error {
 	fromURLs := c.IsSet("from-urls")
 	fromHTML := c.IsSet("from-html")
 	if (fromURLs && fromHTML) || (!fromURLs && !fromHTML) {
-		return errors.Errorf("must provide exactly on of --from-urls or --from-html")
+		return errors.Errorf("must provide exactly one of --from-urls or --from-html")
 	}
 	w := newParseWorker(c.String("images"))
 	if fromURLs {
-		return w.FromURLs(c.String("from-urls"), c.String("out"))
+		return w.FromURLs(c.String("from-urls"), c.String("cards"))
 	}
 	if fromHTML {
-		return w.FromHTML(c.String("from-html"), c.String("out"))
+		return w.FromHTML(c.String("from-html"), c.String("cards"))
 	}
 	panic("unreachable")
 }
@@ -113,7 +131,7 @@ func (w *parseWorker) FromURLs(urlsPath, outCards string) error {
 		scanner := bufio.NewScanner(f)
 		for scanner.Scan() {
 			line := scanner.Text()
-			requests <- newWorkRequestURL(line)
+			requests <- newRequestURL(line)
 		}
 		close(requests)
 	}()
@@ -130,7 +148,7 @@ func (w *parseWorker) FromHTML(file, out string) error {
 	requests := make(chan workRequest)
 	go func() {
 		if err := w.forEachHTML(file, func(path string) {
-			requests <- newWorkRequestHTML(path)
+			requests <- newRequestHTML(path)
 		}); err != nil {
 			log.WithError(err).Error("failed to traverse and parse")
 		}
@@ -144,7 +162,7 @@ func (w *parseWorker) FinishWork(
 	outCards string,
 ) error {
 	wg := new(sync.WaitGroup)
-	for i := 0; i < 8; i++ {
+	for i := 0; i < 24; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -182,11 +200,11 @@ type workRequest struct {
 	file *string
 }
 
-func newWorkRequestURL(u string) workRequest {
+func newRequestURL(u string) workRequest {
 	return workRequest{url: &u}
 }
 
-func newWorkRequestHTML(path string) workRequest {
+func newRequestHTML(path string) workRequest {
 	return workRequest{file: &path}
 }
 
@@ -308,7 +326,18 @@ func AllCardURLs() ([]string, error) {
 
 // TODO: proxy this
 func fetchURL(u string) ([]byte, error) {
-	resp, err := http.Get(u)
+	token := os.Getenv("PROXYCRAWL_TOKEN")
+	if token == "" {
+		log.Warning("not using token, env POXYCRAWL_TOKEN not set")
+		resp, err := retryablehttp.Get(u)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		return ioutil.ReadAll(resp.Body)
+	}
+	escaped := url.QueryEscape(u)
+	resp, err := http.Get(fmt.Sprintf("https://api.proxycrawl.com/?token=%s&url=%s", token, escaped))
 	if err != nil {
 		return nil, err
 	}
@@ -393,23 +422,33 @@ func WriteAllCardURLs(path string) error {
 
 // Card represents a single card.
 type Card struct {
-	Image        []byte              `json:"-"`
-	URL          string              `json:"url"`
-	NameEnglish  string              `json:"name_en"`
-	NameJapanese string              `json:"name_jp"`
-	Type         string              `json:"type"`
-	Attribute    string              `json:"attribute"`
-	Types        []string            `json:"types"`
-	Level        int                 `json:"level"`
-	Attack       int                 `json:"attack"`
-	Defense      int                 `json:"defense"`
-	Passcode     int                 `json:"passcode"`
-	EffectTypes  []string            `json:"effect_types"`
-	Property     string              `json:"property"`
-	Statuses     []string            `json:"statuses"`
-	Description  string              `json:"description"`
-	Releases     []Release           `json:"releases"`
-	Categories   map[string][]string `json:"categories"`
+	Image           []byte              `json:"-"`
+	URL             string              `json:"url"`
+	NameEnglish     string              `json:"name_en"`
+	NameJapanese    string              `json:"name_jp"`
+	OtherNames      string              `json:"other_names"`
+	Type            string              `json:"type"`
+	Attribute       string              `json:"attribute"`
+	Types           []string            `json:"types"`
+	Level           int                 `json:"level"`
+	Rank            int                 `json:"rank"`
+	Materials       string              `json:"materials"`
+	FusionMaterial  []string            `json:"fusion_material"`
+	RitualSpell     string              `json:"ritual_spell"`
+	RitualMonster   string              `json:"ritual_monster"`
+	SummonedBy      []string            `json:"summoned_by"`
+	SynchroMaterial []string            `json:"synchro_material"`
+	PendulumScale   int                 `json:"pendulum_scale"`
+	LimitationText  string              `json:"limitation_text"`
+	Attack          string              `json:"attack"`
+	Defense         string              `json:"defense"`
+	Passcode        int                 `json:"passcode"`
+	EffectTypes     []string            `json:"effect_types"`
+	Property        string              `json:"property"`
+	Statuses        []string            `json:"statuses"`
+	Description     string              `json:"description"`
+	Releases        []Release           `json:"releases"`
+	Categories      map[string][]string `json:"categories"`
 }
 
 // EmptyCard ...
@@ -424,8 +463,9 @@ type Release struct {
 }
 
 var (
-	reSplitSlash = regexp.MustCompile(`\s*/\s*`)
-	reLevel      = regexp.MustCompile(`^\s*(\d+)`)
+	reSplit       = regexp.MustCompile(`\s*(/|,)\s*`)
+	reFirstNumber = regexp.MustCompile(`^\s*(\d+)`)
+	reLastNumber  = regexp.MustCompile(`(\d+)\s*$`)
 )
 
 // NewCardFromURL parses a Card from the given url string.
@@ -469,16 +509,18 @@ func NewCardFromReader(
 	if !ok {
 		return EmptyCard, errors.Errorf("missing url")
 	}
+	entry = entry.WithField("url", card.URL)
 
 	// Image
-	imgSrc, ok := doc.Find(`td[class="cardtable-cardimage"] img`).First().Attr("src")
-	if !ok {
-		return EmptyCard, errors.Errorf("missing img src")
-	}
 	if fetchImage {
-		card.Image, err = fetchURL(imgSrc)
-		if err != nil {
-			return EmptyCard, err
+		imgSrc, ok := doc.Find(`td[class="cardtable-cardimage"] img`).First().Attr("src")
+		if !ok {
+			log.WithError(err).Errorf("missing img src")
+		} else {
+			card.Image, err = fetchURL(imgSrc)
+			if err != nil {
+				log.WithError(err).Errorf("failed to fetch image: %s", imgSrc)
+			}
 		}
 	}
 
@@ -492,16 +534,18 @@ func NewCardFromReader(
 				card.NameEnglish = data
 			case "Japanese", "Japanese (base)":
 				card.NameJapanese = strings.Replace(data, "Check translation", "", -1)
+			case "Other names":
+				card.OtherNames = data
 			case "Card type":
 				card.Type = data
 			case "Property":
 				card.Property = data
 			case "Attribute":
 				card.Attribute = data
-			case "Types":
-				card.Types = reSplitSlash.Split(data, -1)
+			case "Types", "Type":
+				card.Types = reSplit.Split(data, -1)
 			case "Level":
-				groups := reLevel.FindStringSubmatch(data)
+				groups := reFirstNumber.FindStringSubmatch(data)
 				if len(groups) != 2 {
 					entry.Errorf("failed to parse level from '%s'", data)
 					break
@@ -512,24 +556,61 @@ func NewCardFromReader(
 					break
 				}
 				card.Level = int(lvl)
+			case "Rank":
+				groups := reFirstNumber.FindStringSubmatch(data)
+				if len(groups) != 2 {
+					entry.Errorf("failed to parse level from '%s'", data)
+					break
+				}
+				rank, err := strconv.ParseInt(groups[1], 10, 0)
+				if err != nil {
+					entry.WithError(err).Errorf("failed to parse int: %s", groups[1])
+					break
+				}
+				card.Rank = int(rank)
+			case "Materials":
+				card.Materials = data
+			case "Fusion Material":
+				types := s.Find(`a`).Map(func(i int, s *goquery.Selection) string {
+					return s.Text()
+				})
+				card.FusionMaterial = dedup(types)
+			case "Ritual Spell Card required":
+				card.RitualSpell = data
+			case "Ritual Monster required":
+				card.RitualMonster = data
+			case "Summoned by the effect of":
+				types := s.Find(`a`).Map(func(i int, s *goquery.Selection) string {
+					return s.Text()
+				})
+				card.SummonedBy = dedup(types)
+			case "Synchro Material":
+				types := s.Find(`a`).Map(func(i int, s *goquery.Selection) string {
+					return s.Text()
+				})
+				card.SynchroMaterial = dedup(types)
+			case "Pendulum Scale":
+				groups := reLastNumber.FindStringSubmatch(data)
+				if len(groups) != 2 {
+					entry.Errorf("failed to parse pendulum scale from '%s'", data)
+					break
+				}
+				scale, err := strconv.ParseInt(groups[1], 10, 0)
+				if err != nil {
+					entry.WithError(err).Errorf("failed to parse int: %s", data)
+					break
+				}
+				card.PendulumScale = int(scale)
+			case "Limitation text":
+				card.LimitationText = data
 			case "ATK / DEF":
-				parts := reSplitSlash.Split(data, -1)
+				parts := reSplit.Split(data, -1)
 				if len(parts) != 2 {
 					entry.WithError(err).Errorf("ATK/DEF didn't have 2 parts: '%s'", data)
 					break
 				}
-				atk, err := strconv.ParseInt(parts[0], 10, 0)
-				if err != nil {
-					entry.WithError(err).Errorf("failed to parse int: %s", parts[0])
-					break
-				}
-				def, err := strconv.ParseInt(parts[1], 10, 0)
-				if err != nil {
-					entry.WithError(err).Errorf("failed to parse int: %s", parts[1])
-					break
-				}
-				card.Attack = int(atk)
-				card.Defense = int(def)
+				card.Attack = clean(parts[0])
+				card.Defense = clean(parts[1])
 			case "Passcode":
 				code, err := strconv.ParseInt(data, 10, 0)
 				if err != nil {
@@ -549,7 +630,8 @@ func NewCardFromReader(
 					}))
 			case "", "French", "German", "Italian", "Korean", "Portuguese", "Spanish",
 				"Japanese (kana)", "Japanese (rōmaji)",
-				"Japanese (translated)", "External links":
+				"Japanese (translated)", "Other names (Japanese)",
+				"Chinese", "External links":
 				break // not relevant
 			default:
 				entry.Warnf("unknown header: '%s'", header)
@@ -578,10 +660,13 @@ func NewCardFromReader(
 				entry.Errorf("releases row isn't len 4: %d", len(parts))
 				return
 			}
-			t, err := time.Parse("2006-01-02", parts[0])
-			if err != nil {
-				entry.WithError(err).Errorf("failed to parse time: '%s'", parts[0])
-				return
+			var t time.Time
+			if parts[0] != "" {
+				t, err = time.Parse("2006-01-02", parts[0])
+				if err != nil {
+					entry.WithError(err).Errorf("failed to parse time: '%s'", parts[0])
+					return
+				}
 			}
 			card.Releases = append(card.Releases, Release{
 				Date:   t,
