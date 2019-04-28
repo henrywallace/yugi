@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -43,6 +44,7 @@ func main() {
 					&cli.StringFlag{Name: "from-html"},
 					&cli.StringFlag{Name: "from-urls"},
 					&cli.StringFlag{Name: "out", Value: "cards.json"},
+					&cli.StringFlag{Name: "images", Value: "images.json"},
 				},
 			},
 		},
@@ -59,36 +61,51 @@ func doParse(c *cli.Context) error {
 	if (fromURLs && fromHTML) || (!fromURLs && !fromHTML) {
 		return errors.Errorf("must provide exactly on of --from-urls or --from-html")
 	}
-	w := newParseWorker()
+	w := newParseWorker(c.String("images"))
 	if fromURLs {
 		return w.FromURLs(c.String("from-urls"), c.String("out"))
 	}
 	if fromHTML {
-		return nil
+		return w.FromHTML(c.String("from-html"), c.String("out"))
 	}
 	panic("unreachable")
 }
 
 type parseWorker struct {
-	mu    *sync.Mutex
-	Cards map[string]Card
+	outImages string
+
+	mu     *sync.Mutex
+	cards  []SrcCard
+	images []SrcImage
 }
 
-func newParseWorker() *parseWorker {
+// SrcCard ...
+type SrcCard struct {
+	Src  string `json:"src"`
+	Card Card   `json:"card"`
+}
+
+// SrcImage ...
+type SrcImage struct {
+	Src   string `json:"src"`
+	Image []byte `json:"image"`
+}
+
+func newParseWorker(outImages string) *parseWorker {
 	return &parseWorker{
-		mu:    new(sync.Mutex),
-		Cards: make(map[string]Card),
+		outImages: outImages,
+		mu:        new(sync.Mutex),
 	}
 }
 
-func (w *parseWorker) FromURLs(urlsPath, outPath string) error {
+func (w *parseWorker) FromURLs(urlsPath, outCards string) error {
 	f, err := os.Open(urlsPath)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	urls := make(chan string)
+	requests := make(chan workRequest)
 	wg := new(sync.WaitGroup)
 	wg.Add(1)
 	go func() {
@@ -96,40 +113,159 @@ func (w *parseWorker) FromURLs(urlsPath, outPath string) error {
 		scanner := bufio.NewScanner(f)
 		for scanner.Scan() {
 			line := scanner.Text()
-			urls <- line
+			requests <- newWorkRequestURL(line)
 		}
-		close(urls)
+		close(requests)
 	}()
+	return w.FinishWork(requests, outCards)
+}
 
+func (w *parseWorker) FromHTML(file, out string) error {
+	f, err := os.Open(file)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	requests := make(chan workRequest)
+	go func() {
+		if err := w.forEachHTML(file, func(path string) {
+			requests <- newWorkRequestHTML(path)
+		}); err != nil {
+			log.WithError(err).Error("failed to traverse and parse")
+		}
+		close(requests)
+	}()
+	return w.FinishWork(requests, out)
+}
+
+func (w *parseWorker) FinishWork(
+	requests <-chan workRequest,
+	outCards string,
+) error {
+	wg := new(sync.WaitGroup)
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			w.worker(urls)
+			w.worker(requests)
 		}()
 	}
-
 	wg.Wait()
-	g, err := os.Create(outPath)
+	if err := w.save(outCards, w.cards); err != nil {
+		return err
+	}
+	if w.outImages != "" {
+		if err := w.save(w.outImages, w.images); err != nil {
+			return err
+		}
+
+	}
+	return nil
+}
+
+func (w *parseWorker) save(out string, thing interface{}) error {
+	f, err := os.Create(out)
 	if err != nil {
 		return err
 	}
-	defer g.Close()
-	return json.NewEncoder(g).Encode(w.Cards)
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", strings.Repeat(" ", 4))
+	return enc.Encode(thing)
 }
 
-func (w *parseWorker) worker(urls <-chan string) {
-	for u := range urls {
-		start := time.Now()
-		card, err := NewCardFromURL(u)
-		if err != nil {
-			log.WithError(err).Errorf("failed to parse new card: %s", u)
-		}
-		w.mu.Lock()
-		w.Cards[u] = card
-		w.mu.Unlock()
-		log.WithField("elapsed", time.Since(start)).Infof("parsed card %s", u)
+// ugh, autogenerate magic i summon you, do thy bidding and abstract!
+
+type workRequest struct {
+	url  *string
+	file *string
+}
+
+func newWorkRequestURL(u string) workRequest {
+	return workRequest{url: &u}
+}
+
+func newWorkRequestHTML(path string) workRequest {
+	return workRequest{file: &path}
+}
+
+func (r workRequest) PeekURL() (string, bool) {
+	if r.url != nil && r.file != nil {
+		panic("invalid work request, all non-nil")
 	}
+	if r.url != nil {
+		return *r.url, true
+	}
+	return "", false
+}
+
+func (r workRequest) PeekFile() (string, bool) {
+	if r.url != nil && r.file != nil {
+		panic("invalid work request, all non-nil")
+	}
+	if r.file != nil {
+		return *r.file, true
+	}
+	return "", false
+}
+
+func (w *parseWorker) worker(requests <-chan workRequest) {
+	for r := range requests {
+		start := time.Now()
+		var src string
+		if u, ok := r.PeekURL(); ok {
+			src = u
+			card, err := NewCardFromURL(u, w.outImages != "")
+			if err != nil {
+				log.WithError(err).Errorf("failed to parse new card: %s", u)
+				return
+			}
+			w.addCard(u, card)
+			if w.outImages != "" {
+				w.addImage(u, card.Image)
+			}
+		} else if file, ok := r.PeekFile(); ok {
+			src = file
+			card, err := NewCardFromHTML(file, w.outImages != "")
+			if err != nil {
+				log.WithError(err).Errorf("failed to parse new card: %s", file)
+				return
+			}
+			w.addCard(file, card)
+			if w.outImages != "" {
+				w.addImage(file, card.Image)
+			}
+		} else {
+			panic("invalid work request, neither url nor html or dir")
+		}
+		log.WithField("elapsed", time.Since(start)).Infof("parsed card %s", src)
+	}
+}
+
+func (w *parseWorker) forEachHTML(root string, f func(path string)) error {
+	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		f(path)
+		return nil
+	})
+}
+
+func (w *parseWorker) addCard(src string, card Card) {
+	w.mu.Lock()
+	w.cards = append(w.cards, SrcCard{src, card})
+	w.mu.Unlock()
+}
+
+func (w *parseWorker) addImage(src string, img []byte) {
+	w.mu.Lock()
+	w.images = append(w.images, SrcImage{src, img})
+	w.mu.Unlock()
 }
 
 // Constants for scraping such as URLs and CSS selectors.
@@ -257,8 +393,8 @@ func WriteAllCardURLs(path string) error {
 
 // Card represents a single card.
 type Card struct {
+	Image        []byte              `json:"-"`
 	URL          string              `json:"url"`
-	Image        []byte              `json:"image"`
 	NameEnglish  string              `json:"name_en"`
 	NameJapanese string              `json:"name_jp"`
 	Type         string              `json:"type"`
@@ -293,28 +429,32 @@ var (
 )
 
 // NewCardFromURL parses a Card from the given url string.
-func NewCardFromURL(u string) (Card, error) {
+func NewCardFromURL(u string, fetchImage bool) (Card, error) {
 	resp, err := http.Get(u)
 	if err != nil {
 		return EmptyCard, err
 	}
 	defer resp.Body.Close()
-	return NewCardFromReader(u, resp.Body)
+	return NewCardFromReader(u, resp.Body, fetchImage)
 }
 
 // NewCardFromHTML is like NewCardFromURL, but it parses from an already
 // fetched HTML file, instead of from the
-func NewCardFromHTML(path string) (Card, error) {
+func NewCardFromHTML(path string, fetchImage bool) (Card, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return EmptyCard, err
 	}
 	defer f.Close()
-	return NewCardFromReader(path, f)
+	return NewCardFromReader(path, f, fetchImage)
 }
 
 // NewCardFromReader ...
-func NewCardFromReader(src string, rdr io.Reader) (Card, error) {
+func NewCardFromReader(
+	src string,
+	rdr io.Reader,
+	fetchImage bool,
+) (Card, error) {
 	var card Card
 	entry := log.WithField("src", src)
 
@@ -335,8 +475,7 @@ func NewCardFromReader(src string, rdr io.Reader) (Card, error) {
 	if !ok {
 		return EmptyCard, errors.Errorf("missing img src")
 	}
-	// TODO: enable this
-	if false {
+	if fetchImage {
 		card.Image, err = fetchURL(imgSrc)
 		if err != nil {
 			return EmptyCard, err
